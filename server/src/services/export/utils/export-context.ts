@@ -44,4 +44,16 @@ export class ExportContext {
     clearRelations() {
         this.relations = {};
     }
+
+    setSkipRelations(skip: boolean) {
+        this.options.skipRelations = skip;
+    }
+
+    setSkipComponentRelations(skip: boolean) {
+        this.options.skipComponentRelations = skip;
+    }
+
+    setDocumentIds(documentIds: string[]) {
+        this.options.documentIds = documentIds;
+    }
 } 

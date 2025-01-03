@@ -1,4 +1,5 @@
 import { Schema } from '@strapi/types';
+import pluginId from '../utils/pluginId';
 
 export function attributeIsUnique(attribute: Schema.Attribute.AnyAttribute): attribute is Schema.Attribute.OfType<'string' | 'text' | 'email' | 'integer' | 'biginteger' | 'float' | 'decimal'> {
     return ['string', 'text', 'email', 'integer', 'biginteger', 'float', 'decimal'].includes(attribute.type);
@@ -7,7 +8,7 @@ export function attributeIsUnique(attribute: Schema.Attribute.AnyAttribute): att
 export function getIdentifierField(model: Schema.Schema): string {
     console.log('getIdentifierField for model:', model.uid);
     // Check for configured idField in plugin options
-    const importExportOptions = model.pluginOptions?.['import-export-entries'] as { idField?: string } | undefined;
+    const importExportOptions = model.pluginOptions?.[pluginId] as { idField?: string } | undefined;
     if (importExportOptions?.idField) {
         const configuredField = importExportOptions.idField;
         console.log('Using configured idField:', configuredField);

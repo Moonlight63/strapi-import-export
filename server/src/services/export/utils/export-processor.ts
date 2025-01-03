@@ -40,23 +40,48 @@ export class ExportProcessor {
         }
 
         logger.debug('Processing schema', context);
-        const populate = buildPopulateForModel(model);
-        this.context.exportedData[currentSlug] = [];
+        const populate = buildPopulateForModel(currentSlug);
+
+        if (!this.context.exportedData[currentSlug]) {
+            this.context.exportedData[currentSlug] = [];
+        }
+
+        // Build filters object correctly
+        const documentIdFilter = this.context.options.documentIds?.length ? {
+            documentId: { $in: this.context.options.documentIds }
+        } : {};
+
+        const searchParams = this.context.options.applySearch && this.context.options.search ? (
+            typeof this.context.options.search === 'string' ? 
+                JSON.parse(this.context.options.search) : 
+                this.context.options.search
+        ) : {};
+
+        const filtersAndDocs = {
+            filters: {
+                ...searchParams.filters,
+                ...documentIdFilter
+            },
+            ...(this.context.options.applySearch && searchParams.sort && { sort: searchParams.sort })
+        };
+
+        console.log('FILTERS AND DOCS', JSON.stringify(filtersAndDocs, null, 2));
 
         // Get all draft entries first
         const draftEntries = await this.services.documents(currentSlug as UID.ContentType).findMany({
-            ...(this.context.options.documentIds ? { documentId: { $in: this.context.options.documentIds } } : {}),
-            ...(this.context.options.applySearch ? this.context.options.search : {}),
+            ...filtersAndDocs,
             status: 'draft',
             populate: {
                 ...populate,
-                ...(this.context.options.exportAllLocales && { 
+                ...(this.context.options.exportAllLocales && {
                     localizations: {
-                        populate: populate
+                        populate
                     }
                 })
             }
         });
+
+        console.log('DRAFT ENTRIES', JSON.stringify(draftEntries, null, 2));
 
         logger.debug(`Found ${draftEntries.length} draft entries`, context);
 
@@ -78,34 +103,26 @@ export class ExportProcessor {
             documentId: draftEntry.documentId
         };
 
-        logger.debug('Processing entry', context);
-
         try {
             const publishedEntry = await this.services.documents(contentType as UID.ContentType).findOne({
                 documentId: draftEntry.documentId,
                 status: 'published',
                 populate: {
                     ...populate,
-                    ...(this.context.options.exportAllLocales && { 
+                    ...(this.context.options.exportAllLocales && {
                         localizations: {
-                            populate: populate
+                            populate
                         }
                     })
                 }
             });
 
-            if (publishedEntry) {
-                logger.debug('Found corresponding published version', context);
-            }
-
             const versions = this.groupByLocale(draftEntry, publishedEntry, model);
             
+            // Only add if there are actual differences
             if (versions.draft || versions.published) {
-                logger.debug('Adding entry to export data', context);
                 this.context.exportedData[contentType].push(versions);
                 this.context.recordProcessed(draftEntry.documentId);
-            } else {
-                logger.debug('Skipping entry - no differences found', context);
             }
         } catch (error) {
             logger.error('Failed to process entry', context, error);
@@ -113,50 +130,71 @@ export class ExportProcessor {
         }
     }
 
-    private groupByLocale(draftEntry: any, publishedEntry: any, model: Schema.Schema): VersionData {
+    private groupByLocale(entry: any, publishedEntry: any, model: Schema.Schema): VersionData {
         const result: VersionData = {};
-        const processedLocales = new Set<string>();
 
-        // Process draft entry
-        if (draftEntry) {
-            result.draft = {};
-            this.processVersion(draftEntry, result.draft, model, processedLocales);
+        // Always remove localizations from the processed data
+        const processEntry = (data) => {
+            const processed = this.processDataWithSchema(data, model, { 
+                processLocalizations: true
+            });
+            delete processed.localizations;
+            return processed;
+        };
+
+        // Compare draft and published versions for each locale
+        const draftData = processEntry(entry);
+        const publishedData = publishedEntry ? processEntry(publishedEntry) : null;
+
+        // Only include draft if it's different from published
+        if (!publishedData || !this.areVersionsEqual(draftData, publishedData)) {
+            result.draft = { default: draftData };
         }
 
-        // Process published entry
+        // Process localizations if exporting all locales
+        if (this.context.options.exportAllLocales && entry.localizations?.length) {
+            for (const draftLoc of entry.localizations) {
+                const locale = draftLoc.locale;
+                if (!locale) continue;
+
+                // Find corresponding published localization
+                const publishedLoc = publishedEntry?.localizations?.find(l => l.locale === locale);
+                
+                const draftLocData = processEntry(draftLoc);
+                const publishedLocData = publishedLoc ? processEntry(publishedLoc) : null;
+
+                // Only include draft if it's different from published
+                if (!publishedLocData || !this.areVersionsEqual(draftLocData, publishedLocData)) {
+                    if (!result.draft) result.draft = {};
+                    result.draft[locale] = draftLocData;
+                }
+            }
+        }
+
+        // Add published versions
         if (publishedEntry) {
-            result.published = {};
-            this.processVersion(publishedEntry, result.published, model, processedLocales);
+            result.published = { default: processEntry(publishedEntry) };
+
+            if (this.context.options.exportAllLocales && publishedEntry.localizations?.length) {
+                for (const publishedLoc of publishedEntry.localizations) {
+                    const locale = publishedLoc.locale;
+                    if (!locale) continue;
+                    result.published[locale] = processEntry(publishedLoc);
+                }
+            }
         }
 
         return result;
     }
 
-    private processVersion(
-        entry: any,
-        versionData: Record<string, any>,
-        model: Schema.Schema,
-        processedLocales: Set<string>
-    ) {
-        const locale = entry.locale || 'default';
-        if (!processedLocales.has(locale)) {
-            versionData[locale] = this.processDataWithSchema(entry, model);
-            processedLocales.add(locale);
-        }
-
-        // Process localizations if they exist and exportAllLocales is true
-        if (this.context.options.exportAllLocales && entry.localizations) {
-            for (const localization of entry.localizations) {
-                const localeKey = localization.locale || 'default';
-                if (!processedLocales.has(localeKey)) {
-                    versionData[localeKey] = this.processDataWithSchema(localization, model);
-                    processedLocales.add(localeKey);
-                }
-            }
-        }
-    }
-
-    private processDataWithSchema(data: any, schema: Schema.Schema): any {
+    private processDataWithSchema(
+        data: any, 
+        schema: Schema.Schema, 
+        options = { 
+            processLocalizations: true,
+        },
+        skipRelationsOverride: boolean | null = null
+    ): any {
         if (!data) return null;
 
         const processed = { ...data };
@@ -165,36 +203,38 @@ export class ExportProcessor {
         delete processed.documentId;
         delete processed.createdBy;
         delete processed.updatedBy;
-        delete processed.localizations;
+
+        // Only remove localizations if not specifically processing them
+        if (!options.processLocalizations) {
+            delete processed.localizations;
+        }
 
         for (const [key, attr] of Object.entries(schema.attributes)) {
-            if (!data[key]) continue;
+            if (data[key] === undefined || data[key] === null) continue;
+
+            if (key === 'localizations' && options.processLocalizations) {
+                processed[key] = data[key]?.map(localization => 
+                    ({...this.processDataWithSchema(localization, schema, { processLocalizations: false }), documentId: localization.documentId})
+                ) || [];
+                continue;
+            }
 
             try {
                 if (isRelationAttribute(attr)) {
-                    if (Array.isArray(data[key])) {
-                        processed[key] = data[key].map(item => 
-                            this.processRelation(item, attr.target)
-                        );
-                    } else {
-                        processed[key] = this.processRelation(data[key], attr.target);
-                    }
+                    console.log('PROCESSING RELATION', attr);
+                    processed[key] = this.processRelation(data[key], attr.target, attr, skipRelationsOverride);
                 } else if (isComponentAttribute(attr)) {
-                    if (Array.isArray(data[key])) {
-                        processed[key] = data[key].map(item => 
+                    if (attr.repeatable) {
+                        processed[key] = data[key]?.map(item => 
                             this.processComponent(item, attr.component)
-                        );
+                        ) || [];
                     } else {
                         processed[key] = this.processComponent(data[key], attr.component);
                     }
                 } else if (isDynamicZoneAttribute(attr)) {
                     processed[key] = this.processDynamicZone(data[key]);
                 } else if (isMediaAttribute(attr)) {
-                    if (Array.isArray(data[key])) {
-                        processed[key] = data[key].map(item => this.processMedia(item));
-                    } else {
-                        processed[key] = this.processMedia(data[key]);
-                    }
+                    processed[key] = this.processMedia(data[key], attr);
                 }
             } catch (error) {
                 logger.error(`Failed to process attribute`, {
@@ -209,117 +249,87 @@ export class ExportProcessor {
         return processed;
     }
 
-    private processRelation(item: any, targetModelUid: string): any {
-        const context = {
-            operation: 'export',
-            contentType: targetModelUid,
-            documentId: item?.documentId
-        };
-
-        if (!item) {
-            logger.debug('Skipping null relation', context);
-            return null;
-        }
+    private processRelation(item: any, targetModelUid: string, attr: Schema.Attribute.Relation, skipRelationsOverride: boolean | null = null): any {
+        if (!item) return null;
+        if (Array.isArray(item) && item.length === 0) return [];
 
         const targetModel = getModel(targetModelUid);
-        if (!targetModel) {
-            logger.warn('Target model not found', context);
-            return null;
-        }
+        if (!targetModel || targetModel.uid === 'admin::user') return null;
 
         const idField = getIdentifierField(targetModel);
-        const relationValue = item[idField];
 
-        if (this.context.options.skipRelations) {
-            logger.debug('Skipping relation processing (skipRelations enabled)', context);
-            return relationValue;
-        }
+        const skipRelations = skipRelationsOverride ?? this.context.options.skipRelations;
 
-        if (!this.context.wasProcessed(item.documentId)) {
-            logger.debug('Adding relation for later processing', {
-                ...context,
-                relationValue
+        if (attr.relation.endsWith('Many') || attr.relation === 'manyWay') {
+            if (!Array.isArray(item)) {
+                logger.warn('Expected array for many relation', { targetModelUid });
+                return [];
+            }
+            return item.map(relItem => {
+                if (!skipRelations && 
+                    !this.context.wasProcessed(relItem.documentId)) {
+                    this.context.addRelation(targetModelUid as UID.ContentType, relItem.documentId);
+                }
+                return relItem[idField];
             });
-            this.context.addRelation(targetModelUid as UID.ContentType, item.documentId);
+        } else {
+            if (Array.isArray(item)) {
+                logger.warn('Expected single item for one relation', { targetModelUid });
+                return null;
+            }
+            if (!skipRelations && 
+                !this.context.wasProcessed(item.documentId)) {
+                this.context.addRelation(targetModelUid as UID.ContentType, item.documentId);
+            }
+            return item[idField];
         }
-
-        return relationValue;
     }
 
     private processComponent(item: any, componentUid: string): any {
-        const context = {
-            operation: 'export',
-            componentType: componentUid
-        };
-
-        if (!item) {
-            logger.debug('Skipping null component', context);
-            return null;
-        }
+        if (!item) return null;
 
         const componentModel = getModel(componentUid);
-        if (!componentModel) {
-            logger.warn('Component model not found', context);
-            return null;
-        }
+        if (!componentModel) return null;
 
-        return this.processDataWithSchema(item, componentModel);
+        return this.processDataWithSchema(item, componentModel, { 
+            processLocalizations: this.context.options.exportAllLocales
+        }, this.context.options.skipComponentRelations);
     }
 
     private processDynamicZone(items: any[]): any[] {
-        if (!Array.isArray(items)) {
-            logger.warn('Dynamic zone value is not an array', {
-                operation: 'export',
-                value: items
-            });
-            return [];
-        }
+        if (!Array.isArray(items)) return [];
 
         return items.map(item => {
-            const context = {
-                operation: 'export',
-                componentType: item?.__component
-            };
-
             const componentModel = getModel(item.__component);
-            if (!componentModel) {
-                logger.warn('Component model not found', context);
-                return null;
-            }
+            if (!componentModel) return null;
 
-            logger.debug('Processing dynamic zone component', context);
             return {
                 __component: item.__component,
-                ...this.processDataWithSchema(item, componentModel)
+                ...this.processDataWithSchema(item, componentModel, {
+                    processLocalizations: this.context.options.exportAllLocales
+                }, this.context.options.skipComponentRelations)
             };
         }).filter(Boolean);
     }
 
-    private processMedia(item: any): any {
-        const context = {
-            operation: 'export',
-            mediaType: item?.mime
-        };
-
-        if (!item) {
-            logger.debug('Skipping null media', context);
-            return null;
-        }
-
-        const { url, ...rest } = item;
-        if (!url) {
-            logger.warn('Media item missing URL', context);
-            return null;
-        }
-
-        // Convert relative URLs to absolute
-        const absoluteUrl = url.startsWith('http') ? url : this.computeUrl(url);
-        logger.debug('Processed media URL', { 
-            ...context,
-            originalUrl: url,
-            absoluteUrl
+    private processMedia(item: any, attr: Schema.Attribute.Media): any {
+        if (!item) return null;
+        
+        const processMediaItem = (mediaItem) => ({
+            url: mediaItem.url.startsWith('/') ? this.computeUrl(mediaItem.url) : mediaItem.url,
+            name: mediaItem.name,
+            caption: mediaItem.caption,
+            hash: mediaItem.hash,
+            alternativeText: mediaItem.alternativeText,
+            createdAt: mediaItem.createdAt,
+            updatedAt: mediaItem.updatedAt,
+            publishedAt: mediaItem.publishedAt,
         });
-        return absoluteUrl;
+
+        if (attr.multiple) {
+            return Array.isArray(item) ? item.map(processMediaItem) : [];
+        }
+        return processMediaItem(item);
     }
 
     private computeUrl(relativeUrl: string): string {
@@ -336,5 +346,12 @@ export class ExportProcessor {
         });
         
         return JSON.stringify(v1) === JSON.stringify(v2);
+    }
+
+    getExportData(): string {
+        return JSON.stringify({
+            version: 3,
+            data: this.context.exportedData
+        }, null, '\t');
     }
 } 
